@@ -71,12 +71,10 @@ class BayesLinear_Normalq(nn.Module):
             lpw = self.prior.loglike(W) + self.prior.loglike(b)
             return output, lqw, lpw
 
-
-
-class bayes_linear_2L(nn.Module):
+class bayes_linear_2L_cifar10(nn.Module):
     """2 hidden layer Bayes By Backprop (VI) Network"""
     def __init__(self, input_dim, output_dim, n_hid, prior_instance):
-        super(bayes_linear_2L, self).__init__()
+        super(bayes_linear_2L_cifar10, self).__init__()
 
         # prior_instance = isotropic_gauss_prior(mu=0, sigma=0.1)
         # prior_instance = spike_slab_2GMM(mu1=0, mu2=0, sigma1=0.135, sigma2=0.001, pi=0.5)
@@ -86,7 +84,12 @@ class bayes_linear_2L(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        self.bfc1 = BayesLinear_Normalq(input_dim, n_hid, self.prior_instance)
+        #These three layers were added from another CIFAR10 implementation: https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+
+        self.bfc1 = BayesLinear_Normalq(16 * 5 * 5, n_hid, self.prior_instance)
         self.bfc2 = BayesLinear_Normalq(n_hid, n_hid, self.prior_instance)
         self.bfc3 = BayesLinear_Normalq(n_hid, output_dim, self.prior_instance)
 
@@ -101,7 +104,10 @@ class bayes_linear_2L(nn.Module):
         tlqw = 0
         tlpw = 0
 
-        x = x.view(-1, self.input_dim)  # view(batch_size, input_dim)
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+
+        x = x.view(-1, 16 * 5 * 5)#x.view(-1, self.input_dim)  # view(batch_size, input_dim)
         # -----------------
         x, lqw, lpw = self.bfc1(x, sample)
         tlqw = tlqw + lqw
@@ -136,6 +142,8 @@ class bayes_linear_2L(nn.Module):
 
         return predictions, tlqw_vec, tlpw_vec
 
+
+
 class BBP_Bayes_Net(BaseNet):
     """Full network wrapper for Bayes By Backprop nets with methods for training, prediction and weight prunning"""
     eps = 1e-6
@@ -165,7 +173,7 @@ class BBP_Bayes_Net(BaseNet):
         if self.cuda:
             torch.cuda.manual_seed(42)
 
-        self.model = bayes_linear_2L(input_dim=self.channels_in * self.side_in * self.side_in,
+        self.model = bayes_linear_2L_cifar10(input_dim=self.channels_in * self.side_in * self.side_in,
                                      output_dim=self.classes, n_hid=self.nhid, prior_instance=self.prior_instance)
         if self.cuda:
             self.model.cuda()
@@ -176,9 +184,9 @@ class BBP_Bayes_Net(BaseNet):
     def create_opt(self):
         #         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-08,
         #                                           weight_decay=0)
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0)
+        #self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0)
 
-    #         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.5)
     #         self.sched = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=1, gamma=10, last_epoch=-1)
 
     def fit(self, x, y, samples=1):
@@ -411,5 +419,3 @@ class BBP_Bayes_Net(BaseNet):
                 n_unmasked += mask_dict[layer_name + '.b'].sum()
 
         return original_state_dict, n_unmasked
-
-

@@ -1,5 +1,4 @@
 from src.priors import *
-
 from src.base_net import *
 
 import torch.nn.functional as F
@@ -23,72 +22,75 @@ def sample_weights(W_mu, b_mu, W_p, b_p):
     return W, b
 
 
-class BayesLinear_Normalq(nn.Module):
-    """Linear Layer where weights are sampled from a fully factorised Normal with learnable parameters. The likelihood
-     of the weight samples under the prior and the approximate posterior are returned with each forward pass in order
-     to estimate the KL term in the ELBO.
+def KLD_cost(mu_p, sig_p, mu_q, sig_q):
+    KLD = 0.5 * (2 * torch.log(sig_p / sig_q) - 1 + (sig_q / sig_p).pow(2) + ((mu_p - mu_q) / sig_p).pow(2)).sum()
+    # https://arxiv.org/abs/1312.6114 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+    return KLD
+
+
+class BayesLinear_local_reparam(nn.Module):
+    """Linear Layer where activations are sampled from a fully factorised normal which is given by aggregating
+     the moments of each weight's normal distribution. The KL divergence is obtained in closed form. Only works
+      with gaussian priors.
     """
-    def __init__(self, n_in, n_out, prior_class):
-        super(BayesLinear_Normalq, self).__init__()
+    def __init__(self, n_in, n_out, prior_sig):
+        super(BayesLinear_local_reparam, self).__init__()
         self.n_in = n_in
         self.n_out = n_out
-        self.prior = prior_class
+        self.prior_sig = prior_sig
 
-        # Learnable parameters -> Initialisation is set empirically.
+        # Learnable parameters
         self.W_mu = nn.Parameter(torch.Tensor(self.n_in, self.n_out).uniform_(-0.1, 0.1))
-        self.W_p = nn.Parameter(torch.Tensor(self.n_in, self.n_out).uniform_(-3, -2))
+        self.W_p = nn.Parameter(
+            torch.Tensor(self.n_in, self.n_out).uniform_(-3, -2))
 
         self.b_mu = nn.Parameter(torch.Tensor(self.n_out).uniform_(-0.1, 0.1))
         self.b_p = nn.Parameter(torch.Tensor(self.n_out).uniform_(-3, -2))
 
-        self.lpw = 0
-        self.lqw = 0
-
     def forward(self, X, sample=False):
         #         print(self.training)
 
-        if not self.training and not sample:  # When training return MLE of w for quick validation
+        if not self.training and not sample:  # This is just a placeholder function
             output = torch.mm(X, self.W_mu) + self.b_mu.expand(X.size()[0], self.n_out)
             return output, 0, 0
 
         else:
 
-            # Tensor.new()  Constructs a new tensor of the same data type as self tensor.
-            # the same random sample is used for every element in the minibatch
-            eps_W = Variable(self.W_mu.data.new(self.W_mu.size()).normal_())
-            eps_b = Variable(self.b_mu.data.new(self.b_mu.size()).normal_())
-
-            # sample parameters
+            # calculate std
             std_w = 1e-6 + F.softplus(self.W_p, beta=1, threshold=20)
             std_b = 1e-6 + F.softplus(self.b_p, beta=1, threshold=20)
 
-            W = self.W_mu + 1 * std_w * eps_W
-            b = self.b_mu + 1 * std_b * eps_b
+            act_W_mu = torch.mm(X, self.W_mu)  # self.W_mu + std_w * eps_W
+            act_W_std = torch.sqrt(torch.mm(X.pow(2), std_w.pow(2)))
 
-            output = torch.mm(X, W) + b.unsqueeze(0).expand(X.shape[0], -1)  # (batch_size, n_output)
+            # Tensor.new()  Constructs a new tensor of the same data type as self tensor.
+            # the same random sample is used for every element in the minibatch output
+            eps_W = Variable(self.W_mu.data.new(act_W_std.size()).normal_(mean=0, std=1))
+            eps_b = Variable(self.b_mu.data.new(std_b.size()).normal_(mean=0, std=1))
 
-            lqw = isotropic_gauss_loglike(W, self.W_mu, std_w) + isotropic_gauss_loglike(b, self.b_mu, std_b)
-            lpw = self.prior.loglike(W) + self.prior.loglike(b)
-            return output, lqw, lpw
+            act_W_out = act_W_mu + act_W_std * eps_W  # (batch_size, n_output)
+            act_b_out = self.b_mu + std_b * eps_b
+
+            output = act_W_out + act_b_out.unsqueeze(0).expand(X.shape[0], -1)
+
+            kld = KLD_cost(mu_p=0, sig_p=self.prior_sig, mu_q=self.W_mu, sig_q=std_w) + KLD_cost(mu_p=0, sig_p=0.1, mu_q=self.b_mu,
+                                                                                      sig_q=std_b)
+            return output, kld, 0
 
 
+class bayes_linear_LR_2L(nn.Module):
+    def __init__(self, input_dim, output_dim, nhid, prior_sig):
+        super(bayes_linear_LR_2L, self).__init__()
 
-class bayes_linear_2L(nn.Module):
-    """2 hidden layer Bayes By Backprop (VI) Network"""
-    def __init__(self, input_dim, output_dim, n_hid, prior_instance):
-        super(bayes_linear_2L, self).__init__()
-
-        # prior_instance = isotropic_gauss_prior(mu=0, sigma=0.1)
-        # prior_instance = spike_slab_2GMM(mu1=0, mu2=0, sigma1=0.135, sigma2=0.001, pi=0.5)
-        # prior_instance = isotropic_gauss_prior(mu=0, sigma=0.1)
-        self.prior_instance = prior_instance
+        n_hid = nhid
+        self.prior_sig = prior_sig
 
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        self.bfc1 = BayesLinear_Normalq(input_dim, n_hid, self.prior_instance)
-        self.bfc2 = BayesLinear_Normalq(n_hid, n_hid, self.prior_instance)
-        self.bfc3 = BayesLinear_Normalq(n_hid, output_dim, self.prior_instance)
+        self.bfc1 = BayesLinear_local_reparam(input_dim, n_hid, self.prior_sig)
+        self.bfc2 = BayesLinear_local_reparam(n_hid, n_hid, self.prior_sig)
+        self.bfc3 = BayesLinear_local_reparam(n_hid, output_dim, self.prior_sig)
 
         # choose your non linearity
         # self.act = nn.Tanh()
@@ -122,7 +124,6 @@ class bayes_linear_2L(nn.Module):
         return y, tlqw, tlpw
 
     def sample_predict(self, x, Nsamples):
-        """Used for estimating the data's likelihood by approximately marginalising the weights with MC"""
         # Just copies type from x, initializes new vector
         predictions = x.data.new(Nsamples, x.shape[0], self.output_dim)
         tlqw_vec = np.zeros(Nsamples)
@@ -136,23 +137,22 @@ class bayes_linear_2L(nn.Module):
 
         return predictions, tlqw_vec, tlpw_vec
 
-class BBP_Bayes_Net(BaseNet):
-    """Full network wrapper for Bayes By Backprop nets with methods for training, prediction and weight prunning"""
-    eps = 1e-6
 
+class BBP_Bayes_Net_LR(BaseNet):
+    """Full network wrapper for Bayes By Backprop nets with methods for training, prediction and weight prunning"""
     def __init__(self, lr=1e-3, channels_in=3, side_in=28, cuda=True, classes=10, batch_size=128, Nbatches=0,
-                 nhid=1200, prior_instance=laplace_prior(mu=0, b=0.1)):
-        super(BBP_Bayes_Net, self).__init__()
+                 nhid=1200, prior_sig=0.1):
+        super(BBP_Bayes_Net_LR, self).__init__()
         cprint('y', ' Creating Net!! ')
         self.lr = lr
         self.schedule = None  # [] #[50,200,400,600]
         self.cuda = cuda
         self.channels_in = channels_in
         self.classes = classes
+        self.nhid = nhid
+        self.prior_sig = prior_sig
         self.batch_size = batch_size
         self.Nbatches = Nbatches
-        self.prior_instance = prior_instance
-        self.nhid = nhid
         self.side_in = side_in
         self.create_net()
         self.create_opt()
@@ -165,11 +165,10 @@ class BBP_Bayes_Net(BaseNet):
         if self.cuda:
             torch.cuda.manual_seed(42)
 
-        self.model = bayes_linear_2L(input_dim=self.channels_in * self.side_in * self.side_in,
-                                     output_dim=self.classes, n_hid=self.nhid, prior_instance=self.prior_instance)
+        self.model = bayes_linear_LR_2L(input_dim=self.channels_in * self.side_in * self.side_in, output_dim=self.classes,
+                                     nhid=self.nhid, prior_sig=self.prior_sig)
         if self.cuda:
-            self.model.cuda()
-        #             cudnn.benchmark = True
+            self.model = self.model.cuda()
 
         print('    Total params: %.2fM' % (self.get_nb_parameters() / 1000000.0))
 
@@ -177,9 +176,6 @@ class BBP_Bayes_Net(BaseNet):
         #         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-08,
         #                                           weight_decay=0)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0)
-
-    #         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
-    #         self.sched = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=1, gamma=10, last_epoch=-1)
 
     def fit(self, x, y, samples=1):
         x, y = to_variable(var=(x, y.long()), cuda=self.cuda)
@@ -230,7 +226,6 @@ class BBP_Bayes_Net(BaseNet):
         return loss.data, err, probs
 
     def sample_eval(self, x, y, Nsamples, logits=True, train=False):
-        """Prediction, only returining result with weights marginalised"""
         x, y = to_variable(var=(x, y.long()), cuda=self.cuda)
 
         out, _, _ = self.model.sample_predict(x, Nsamples)
@@ -253,7 +248,6 @@ class BBP_Bayes_Net(BaseNet):
         return loss.data, err, probs
 
     def all_sample_eval(self, x, y, Nsamples):
-        """Returns predictions for each MC sample"""
         x, y = to_variable(var=(x, y.long()), cuda=self.cuda)
 
         out, _, _ = self.model.sample_predict(x, Nsamples)
@@ -354,12 +348,10 @@ class BBP_Bayes_Net(BaseNet):
                 for i in range(Nsamples):
                     W, b = sample_weights(W_mu=W_mu, b_mu=b_mu, W_p=W_p, b_p=b_p)
                     # Note that this will currently not work with slab and spike prior
-                    KL_W += isotropic_gauss_loglike(W, W_mu, std_w,
-                                                    do_sum=False) - self.model.prior_instance.loglike(W,
-                                                                                                      do_sum=False)
-                    KL_b += isotropic_gauss_loglike(b, b_mu, std_b,
-                                                    do_sum=False) - self.model.prior_instance.loglike(b,
-                                                                                                      do_sum=False)
+                    KL_W += isotropic_gauss_loglike(W, W_mu, std_w, do_sum=False) - self.model.prior_instance.loglike(W,
+                                                                                                                      do_sum=False)
+                    KL_b += isotropic_gauss_loglike(b, b_mu, std_b, do_sum=False) - self.model.prior_instance.loglike(b,
+                                                                                                                      do_sum=False)
 
                 KL_W /= Nsamples
                 KL_b /= Nsamples
@@ -411,5 +403,3 @@ class BBP_Bayes_Net(BaseNet):
                 n_unmasked += mask_dict[layer_name + '.b'].sum()
 
         return original_state_dict, n_unmasked
-
-

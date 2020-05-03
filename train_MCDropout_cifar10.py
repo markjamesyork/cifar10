@@ -4,27 +4,24 @@ import torch.utils.data
 from torchvision import transforms, datasets
 import argparse
 import matplotlib
-from src.KF_Laplace.model import *
-from src.KF_Laplace.hessian_operations import chol_scale_invert_kron_factor
+from src.MC_dropout.model_cifar10 import *
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
-parser = argparse.ArgumentParser(description='Train Bayesian Neural Net on MNIST with MC Dropout Variational Inference')
+parser = argparse.ArgumentParser(description='Train Bayesian Neural Net on CIFAR10 with MC Dropout Variational Inference')
 
-parser.add_argument('--weight_decay', type=float, nargs='?', action='store', default=0.01,
-                    help='Specify the precision of an isotropic Gaussian prior. Default: 0.01')
-parser.add_argument('--hessian_diag_sig', type=float, nargs='?', action='store', default=0.15,
-                    help='Specify Gaussian prior std for a diagonal term that is added to the approximate hessian. Default: 0.15.')
-parser.add_argument('--epochs', type=int, nargs='?', action='store', default=10,
-                    help='How many epochs to train. Default: 10.')
+parser.add_argument('--weight_decay', type=float, nargs='?', action='store', default=1,
+                    help='Specify the precision of an isotropic Gaussian prior. Default: 1.')
+parser.add_argument('--epochs', type=int, nargs='?', action='store', default=60,
+                    help='How many epochs to train. Default: 60.')
 parser.add_argument('--lr', type=float, nargs='?', action='store', default=1e-3,
                     help='learning rate. Default: 1e-3.')
-parser.add_argument('--models_dir', type=str, nargs='?', action='store', default='KFLaplace_models',
-                    help='Where to save learnt weights, train vectors and Hessian params. Default: \'KFLaplace_models\'.')
-parser.add_argument('--results_dir', type=str, nargs='?', action='store', default='KFLaplace_results',
-                    help='Where to save learnt training plots. Default: \'KFLaplace_results\'.')
+parser.add_argument('--models_dir', type=str, nargs='?', action='store', default='MCdrop_models_CIFAR10',
+                    help='Where to save learnt weights and train vectors. Default: \'MCdrop_models_CIFAR10\'.')
+parser.add_argument('--results_dir', type=str, nargs='?', action='store', default='MCdrop_results_CIFAR10',
+                    help='Where to save learnt training plots. Default: \'MCdrop_results_CIFAR10\'.')
 args = parser.parse_args()
 
 
@@ -38,10 +35,10 @@ mkdir(models_dir)
 mkdir(results_dir)
 # ------------------------------------------------------------------------------------------------------
 # train config
-NTrainPointsMNIST = 60000
-batch_size = 128
+NTrainPointsCIFAR10 = 10000
+batch_size = 256
 nb_epochs = args.epochs
-log_interval = 1
+log_interval = 2
 
 
 # ------------------------------------------------------------------------------------------------------
@@ -50,21 +47,19 @@ cprint('c', '\nData:')
 
 # load data
 
-# data augmentation
-transform_train = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.1307,), std=(0.3081,))
-])
-
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.1307,), std=(0.3081,))
-])
+#We are using 'transform' below, instead of 'transform_train' and 'transform_test', for CIFAR10
+transform = transforms.Compose([transforms.ToTensor(), \
+     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
 use_cuda = torch.cuda.is_available()
 
-trainset = datasets.MNIST(root='../data', train=True, download=True, transform=transform_train)
-valset = datasets.MNIST(root='../data', train=False, download=True, transform=transform_test)
+#trainset = datasets.MNIST(root='../data', train=True, download=True, transform=transform_train)
+#valset = datasets.MNIST(root='../data', train=False, download=True, transform=transform_test)
+trainset = datasets.CIFAR10(root='../data', train=True, download=True, transform=transform)
+valset = datasets.CIFAR10(root='../data', train=False, download=True, transform=transform)
+
+print('Trainset Length: ',len(trainset))
+print('Valset Length: ',len(valset))
 
 if use_cuda:
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, pin_memory=True,
@@ -83,19 +78,19 @@ else:
 cprint('c', '\nNetwork:')
 
 lr = args.lr
-prior_sig = np.sqrt(1/args.weight_decay)
 ########################################################################################
 
-
-
-net = KBayes_Net(lr=lr, channels_in=1, side_in=28, cuda=use_cuda, classes=10, n_hid=1200, batch_size=batch_size, prior_sig=prior_sig)
-
+'''net = MC_drop_net(lr=lr, channels_in=1, side_in=28, cuda=use_cuda, classes=10, batch_size=batch_size,
+                  weight_decay=args.weight_decay, n_hid=1200)'''
+net = MC_drop_net(lr=lr, channels_in=3, side_in=32, cuda=use_cuda, classes=10, batch_size=batch_size,
+                  weight_decay=args.weight_decay, n_hid=1200)
 ## ---------------------------------------------------------------------------------------------------------------------
 # train
 epoch = 0
 cprint('c', '\nTrain:')
 
 print('  init cost variables:')
+kl_cost_train = np.zeros(nb_epochs)
 pred_cost_train = np.zeros(nb_epochs)
 err_train = np.zeros(nb_epochs)
 
@@ -113,6 +108,8 @@ for i in range(epoch, nb_epochs):
     nb_samples = 0
 
     for x, y in trainloader:
+        #print('x',x.shape)
+        #print('y',y.shape)
         cost_pred, err = net.fit(x, y)
 
         err_train[i] += err
@@ -174,35 +171,6 @@ np.save(results_dir + '/cost_train.npy', pred_cost_train)
 np.save(results_dir + '/cost_dev.npy', cost_dev)
 np.save(results_dir + '/err_train.npy', err_train)
 np.save(results_dir + '/err_dev.npy', err_dev)
-
-## Time to do Laplace Approximation.
-print('MAP configuration reached: Calculating block diagonal Hessian.')
-
-# Get hessian factors
-EQ1, EHH1, MAP1, EQ2, EHH2, MAP2, EQ3, EHH3, MAP3 = net.get_K_laplace_params(trainloader)
-
-h_params = [EQ1, EHH1, MAP1, EQ2, EHH2, MAP2, EQ3, EHH3, MAP3]
-save_object(h_params, models_dir+'/block_hessian_params.pkl')
-print('Hessian Parameters Saved')
-
-data_scale = np.sqrt(len(trainset))
-prior_sig = args.hessian_diag_sig
-prior_prec = 1/prior_sig**2
-prior_scale = np.sqrt(prior_prec)
-
-# Scale and invert factors
-# upper_Qinv, lower_HHinv
-print('Scaling and inverting Hessian factors')
-scale_inv_EQ1 = chol_scale_invert_kron_factor(EQ1, prior_scale, data_scale, upper=True)
-scale_inv_EHH1 = chol_scale_invert_kron_factor(EHH1, prior_scale, data_scale, upper=False)
-
-scale_inv_EQ2 = chol_scale_invert_kron_factor(EQ2, prior_scale, data_scale, upper=True)
-scale_inv_EHH2 = chol_scale_invert_kron_factor(EHH2, prior_scale, data_scale, upper=False)
-
-scale_inv_EQ3 = chol_scale_invert_kron_factor(EQ3, prior_scale, data_scale, upper=True)
-scale_inv_EHH3 = chol_scale_invert_kron_factor(EHH3, prior_scale, data_scale, upper=False)
-
-
 
 ## ---------------------------------------------------------------------------------------------------------------------
 # fig cost vs its
