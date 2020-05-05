@@ -1,5 +1,5 @@
 from src.base_net import *
-from optimizers import *
+from src.Stochastic_Gradient_Langevin_Dynamics.optimizers import *
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
